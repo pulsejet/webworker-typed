@@ -3,6 +3,10 @@
     "version": "1.0.3",
     "license": "MIT",
     "description": "Typed Web Workers with Async/Await",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/pulsejet/webworker-typed"
+    },
     "main": "dist/index.js",
     "types": "dist/index.d.ts",
     "type": "module",
