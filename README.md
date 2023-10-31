@@ -34,7 +34,8 @@ From your main thread, import the worker and call the functions:
 import { importWorker } from 'webworker-typed';
 import type MyWorker from './my-worker.ts';
 
-const worker = importWorker<typeof MyWorker>(new Worker(new URL('./XImgWorkerStub.ts', import.meta.url)));
+const untypedWorker = new Worker(new URL('./my-worker.ts', import.meta.url)); // example with webpack
+const worker = importWorker<typeof MyWorker>(untypedWorker);
 
 async (() => {
   // all imported methods are async
