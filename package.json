@@ -1,14 +1,18 @@
 {
-    "name": "worker-typed",
+    "name": "webworker-typed",
     "version": "1.0.0",
     "license": "MIT",
     "description": "Typed Web Workers with Async/Await",
     "main": "dist/index.js",
     "types": "dist/index.d.ts",
+    "type": "module",
     "scripts": {
         "build": "tsc"
     },
     "author": "Varun Patil",
+    "peerDependencies": {
+        "typescript": "^5.2.2"
+    },
     "devDependencies": {
         "typescript": "^5.2.2"
     }
