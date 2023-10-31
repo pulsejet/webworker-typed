@@ -45,9 +45,9 @@ type Async<T extends FunctionMap> = {
  * async function asyncFoo() { return 'bar'; }
  *
  * export default exportWorker({
- *  foo,
- *  asyncFoo,
- *  inline: () => 'bar',
+ *   foo,
+ *   asyncFoo,
+ *   inline: () => 'bar',
  * });
  * ```
  */
@@ -87,12 +87,12 @@ export function exportWorker<T extends FunctionMap>(handlers: T): Async<T> {
  *
  * const worker = importWorker<typeof MyWorker>(new Worker(new URL('./XImgWorkerStub.ts', import.meta.url)));
  *
- * async (() => {
+ * (async () => {
  *   // all methods are async
  *   console.assert(await worker.foo() === 'bar');
  *   console.assert(await worker.asyncFoo() === 'bar');
  *   console.assert(await worker.inline() === 'bar');
- * });
+ * })();
  * ```
  */
 export function importWorker<T>(worker: Worker) {

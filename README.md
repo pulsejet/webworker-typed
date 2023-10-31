@@ -37,12 +37,12 @@ import type MyWorker from './my-worker.ts';
 const untypedWorker = new Worker(new URL('./my-worker.ts', import.meta.url)); // example with webpack
 const worker = importWorker<typeof MyWorker>(untypedWorker);
 
-async (() => {
+(async () => {
   // all imported methods are async
   console.assert(await worker.foo() === 'bar');
   console.assert(await worker.asyncFoo() === 'bar');
   console.assert(await worker.inline() === 'bar');
-});
+})();
 ```
 
 ## License
