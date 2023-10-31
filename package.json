@@ -1,6 +1,6 @@
 {
     "name": "webworker-typed",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "license": "MIT",
     "description": "Typed Web Workers with Async/Await",
     "main": "dist/index.js",
