@@ -4,7 +4,7 @@
 type CommRequest = {
   reqid: number;
   name: string;
-  args: any[];
+  args: unknown[];
 };
 
 /**
@@ -12,24 +12,24 @@ type CommRequest = {
  */
 type CommResult = {
   reqid: number;
-  resolve?: any;
+  resolve?: unknown;
   reject?: string;
 };
 
 /**
  * Map of function names to functions.
  */
-type FunctionMap = { [name: string]: Function };
+type FunctionMap = { [name: string]: Function; };
 
 /**
  * Utility type to convert all methods in an object to async.
  */
 type Async<T extends FunctionMap> = {
   [K in keyof T]: T[K] extends (...args: infer A) => Promise<infer R>
-    ? (...args: A) => Promise<R>
-    : T[K] extends (...args: infer A) => infer R
-    ? (...args: A) => Promise<R>
-    : T[K];
+  ? (...args: A) => Promise<R>
+  : T[K] extends (...args: infer A) => infer R
+  ? (...args: A) => Promise<R>
+  : T[K];
 };
 
 /**
@@ -52,7 +52,7 @@ type Async<T extends FunctionMap> = {
  * ```
  */
 export function exportWorker<T extends FunctionMap>(handlers: T): Async<T> {
-  self.onmessage = async ({ data }: { data: CommRequest }) => {
+  self.onmessage = async ({ data }: { data: CommRequest; }) => {
     try {
       // Get handler from registrations
       const handler = handlers[data.name];
@@ -96,10 +96,10 @@ export function exportWorker<T extends FunctionMap>(handlers: T): Async<T> {
  * ```
  */
 export function importWorker<T>(worker: Worker) {
-  const promises = new Map<number, { resolve: Function; reject: Function }>();
+  const promises = new Map<number, { resolve: Function; reject: Function; }>();
 
   // Handle messages from worker
-  worker.onmessage = ({ data }: { data: CommResult }) => {
+  worker.onmessage = ({ data }: { data: CommResult; }) => {
     const { reqid, resolve, reject } = data;
     if (resolve) promises.get(reqid)?.resolve(resolve);
     if (reject) promises.get(reqid)?.reject(reject);
@@ -113,11 +113,54 @@ export function importWorker<T>(worker: Worker) {
         return await new Promise((resolve, reject) => {
           const reqid = Math.random();
           promises.set(reqid, { resolve, reject });
-          target.postMessage({ reqid, name, args } as CommRequest);
+          target.postMessage({ reqid, name, args } as CommRequest, {
+            transfer: args.filter(isTransferred)
+          });
         });
       };
     },
   });
 
   return proxy as T;
+}
+
+// Key to mark an object as transferred
+const TRANSFERRED_KEY = "_wwt_is_transferred_";
+
+/**
+ * Type to mark an object as transferred.
+ *
+ * @example
+ * ```ts
+ * // myworker.ts
+ * function foo(buffer: Transferred<ArrayBuffer>) {
+ *  // buffer is transferred
+ * }
+ */
+export type Transferred<T> = T & { [TRANSFERRED_KEY]: true; };
+
+/**
+ * Mark an object as transferred.
+ *
+ * @param object Object to transfer
+ *
+ * @example
+ * ```ts
+ * // main.ts
+ * worker.foo(transfer(new ArrayBuffer(1000)));
+ */
+export function transfer<T extends Transferable>(object: T): Transferred<T> {
+  if (typeof object === 'object') {
+    (<any>object)[TRANSFERRED_KEY] = true;
+    return object as Transferred<T>;
+  }
+
+  throw new Error('Only objects can be transferred');
+}
+
+/**
+ * Check if an object is transferred.
+ */
+function isTransferred<T>(object: T): object is Transferred<T> {
+  return typeof object === 'object' && (<any>object)[TRANSFERRED_KEY] === true;
 }
