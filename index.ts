@@ -24,15 +24,11 @@ type CommResult = {
  */
 type FunctionMap = { [name: string]: Function; };
 
-/**
- * Utility type to convert all methods in an object to async.
- */
+// 将所有方法转换为异步,方法参数结尾增加一个numer类型的参数，并将参数内传递的函数转换为可以异步
 type Async<T extends FunctionMap> = {
-    [K in keyof T]: T[K] extends (...args: infer A) => Promise<infer R>
+    [K in keyof T]: T[K] extends (...args: infer A) => infer R
     ? (...args: A) => Promise<R>
-    : T[K] extends (...args: infer A) => infer R
-    ? (...args: A) => Promise<R>
-    : T[K];
+    : never;
 };
 
 
@@ -94,7 +90,6 @@ const messageHandler = (thread: Worker | Window & typeof globalThis,
     };
     let cgCdlieId: number;
     return async ({ data }: { data: CommRequest | CommResult; }) => {
-        console.log('messageHandler', data);
         if (data.isRequest) {
             try {
                 const handler = handlers.get(data.name);
@@ -103,25 +98,27 @@ const messageHandler = (thread: Worker | Window & typeof globalThis,
                 cg.has(handler) && cg.set(handler, Date.now());
 
                 // Run handler
-                let result = handler(...data.args.map((arg: unknown) => {
-                    // @ts-ignore
-                    if (typeof arg === 'object' && arg[TRANSFERRED_FUNCTION_KEY] === true) {
-                        const { name } = arg as { name: string;[TRANSFERRED_FUNCTION_KEY]: true; };
-                        return async function wrapper(...args: unknown[]) {
-                            return await new Promise((resolve, reject) => {
-                                const reqid = Math.random();
-                                promises.set(reqid, { resolve, reject });
-                                thread.postMessage({ isRequest: true, reqid, name, args: args.map(tryObj2fn) } as CommRequest, {
-                                    transfer: getTransferableObjects(args)
+                let result = handler(
+                    ...data.args.map((arg: unknown) => {
+                        // @ts-ignore
+                        if (typeof arg === 'object' && arg[TRANSFERRED_FUNCTION_KEY] === true) {
+                            const { name } = arg as { name: string;[TRANSFERRED_FUNCTION_KEY]: true; };
+                            return async function wrapper(...args: unknown[]) {
+                                return await new Promise((resolve, reject) => {
+                                    const reqid = Math.random();
+                                    promises.set(reqid, { resolve, reject });
+                                    thread.postMessage({ isRequest: true, reqid, name, args: args.map(tryObj2fn) } as CommRequest, {
+                                        transfer: getTransferableObjects(args)
+                                    });
                                 });
-                            });
-                        };
-                    }
-                    return arg;
-                }));
+                            };
+                        }
+                        return arg;
+                    })
+                );
 
                 if (result instanceof Promise) {
-                    result = await result;
+                    result = await result.then(async res => await res);
                 }
 
                 // 此处继续增加筛选可以继续转发函数但是会导致性能问题，要啥自行车
@@ -136,8 +133,12 @@ const messageHandler = (thread: Worker | Window & typeof globalThis,
             }
         } else {
             const { reqid, resolve, reject } = data;
-            if (resolve) promises.get(reqid)?.resolve(resolve);
-            if (reject) promises.get(reqid)?.reject(reject);
+
+            if ('resolve' in data) {
+                promises.get(reqid)?.resolve(resolve);
+            } else {
+                promises.get(reqid)?.reject(reject);
+            }
             promises.delete(reqid);
         }
 
