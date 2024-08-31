@@ -2,35 +2,174 @@
  * Data sent from main thread to worker.
  */
 type CommRequest = {
-  reqid: number;
-  name: string;
-  args: unknown[];
+    isRequest: true;
+    reqid: number;
+    name: string;
+    args: unknown[];
 };
 
 /**
  * Data sent from worker to main thread.
  */
 type CommResult = {
-  reqid: number;
-  resolve?: unknown;
-  reject?: string;
+    isRequest: false;
+    reqid: number;
+    resolve?: unknown;
+    reject?: string;
 };
+
 
 /**
  * Map of function names to functions.
  */
 type FunctionMap = { [name: string]: Function; };
 
-/**
- * Utility type to convert all methods in an object to async.
- */
+
 type Async<T extends FunctionMap> = {
-  [K in keyof T]: T[K] extends (...args: infer A) => Promise<infer R>
-  ? (...args: A) => Promise<R>
-  : T[K] extends (...args: infer A) => infer R
-  ? (...args: A) => Promise<R>
-  : T[K];
+    [K in keyof T]: T[K] extends (...args: infer A) => Promise<infer R>
+    ? (...args: SyncArgs<A>) => Promise<R>
+    :
+    (
+        T[K] extends (...args: infer A) => infer B
+        ? (...args: SyncArgs<A>) => Promise<B> : never
+    )
 };
+
+type SyncArgs<T> = {
+    [K in keyof T]: T[K] extends (...args: infer A) => Promise<infer R>
+    ? (...args: A) => R | Promise<R> :T[K]
+}
+
+
+const TRANSFERRED_FUNCTION_KEY = "_wwt_is_transferred_function_";
+// Timeout for cleaning up old functions
+const TEMP_FUNCTION_CG = 30 * 1000;
+const TEMP_NAME_PREFIX = 'temp_fn_';
+
+// 深度获取全部可转移的对象，跳过重复引用
+const getTransferableObjects = (object: unknown, seen = new WeakSet()): Transferable[] => {
+    if (typeof object !== 'object' || object === null || seen.has(object)) return [];
+    seen.add(object);
+    if (object instanceof Array) return object.flatMap(item => getTransferableObjects(item, seen));
+    if (object instanceof OffscreenCanvas
+        || object instanceof ImageBitmap
+        || object instanceof MessagePort
+        || object instanceof ReadableStream
+        || object instanceof WritableStream
+        || object instanceof TransformStream
+        || object instanceof VideoFrame
+        || object instanceof ArrayBuffer
+    ) return [object];
+    return Object.values(object).flatMap(value => getTransferableObjects(value, seen));
+};
+
+
+const fn2obj = (fn: Function, handlers: Map<string, Function>) => {
+    const name = TEMP_NAME_PREFIX + Math.random().toString(32).slice(2);
+    handlers.set(name, fn);
+    return { [TRANSFERRED_FUNCTION_KEY]: true, name };
+};
+
+// 代理消息处理，统一处理消息
+const messageHandler = (thread: Worker | Window & typeof globalThis,
+    handlers = new Map<string, Function>(),
+    promises = new Map<number, { resolve: Function; reject: Function; }>(),
+    cg = new WeakMap<Function, number>()
+) => {
+
+    // 尝试还原函数
+    const tryObj2fn = (obj: any) => {
+        if (typeof obj === 'object' && obj[TRANSFERRED_FUNCTION_KEY] === true) {
+            return (...args: unknown[]) => {
+                return new Promise((resolve, reject) => {
+                    const reqid = Math.random();
+                    thread.postMessage({
+                        isRequest: true,
+                        reqid, name: obj.name,
+                        args: args.map((arg) => typeof arg === 'function' ? fn2obj(arg, handlers) : arg)
+                    } as CommRequest, {
+                        transfer: getTransferableObjects(args)
+                    });
+                    promises.set(reqid, { resolve, reject });
+                });
+            };
+        }
+        return obj;
+    };
+    let cgCdlieId: number;
+    return async ({ data }: { data: CommRequest | CommResult; }) => {
+        if (data.isRequest) {
+            try {
+                const handler = handlers.get(data.name);
+                if (!handler) throw new Error(`[BUG] No handler for type ${data.name}`);
+
+                cg.has(handler) && cg.set(handler, Date.now());
+
+                // Run handler
+                let result = handler(
+                    ...data.args.map((arg: unknown) => {
+                        // @ts-ignore
+                        if (typeof arg === 'object' && arg[TRANSFERRED_FUNCTION_KEY] === true) {
+                            const { name } = arg as { name: string;[TRANSFERRED_FUNCTION_KEY]: true; };
+                            return async function wrapper(...args: unknown[]) {
+                                return await new Promise((resolve, reject) => {
+                                    const reqid = Math.random();
+                                    promises.set(reqid, { resolve, reject });
+                                    thread.postMessage({ isRequest: true, reqid, name, args: args.map(tryObj2fn) } as CommRequest, {
+                                        transfer: getTransferableObjects(args)
+                                    });
+                                });
+                            };
+                        }
+                        return arg;
+                    })
+                );
+
+                if (result instanceof Promise) {
+                    result = await result.then(async res => await res);
+                }
+
+                // 此处继续增加筛选可以继续转发函数但是会导致性能问题，要啥自行车
+
+                // Success - post back to main thread
+                thread.postMessage({ isRequest: false, reqid: data.reqid, resolve: result } as CommResult, {
+                    // Auto try transfer objects
+                    transfer: getTransferableObjects(result)
+                });
+            } catch (e: any) {
+                thread.postMessage({ isRequest: false, reqid: data.reqid, reject: e.message } as CommResult);
+            }
+        } else {
+            const { reqid, resolve, reject } = data;
+
+            if ('resolve' in data) {
+                promises.get(reqid)?.resolve(resolve);
+            } else {
+                promises.get(reqid)?.reject(reject);
+            }
+            promises.delete(reqid);
+        }
+
+        clearTimeout(cgCdlieId);
+        // 节流遍历
+        cgCdlieId = setTimeout(() => {
+            // 遍历获得全部
+            for (const [name, fn] of handlers) {
+                if (!name.startsWith(TEMP_NAME_PREFIX)) continue;
+                const now = Date.now();
+                if (!cg.has(fn)) {
+                    cg.set(fn, now);
+                    continue;
+                }
+                if (now - cg.get(fn)! > TEMP_FUNCTION_CG) {
+                    handlers.delete(name);
+                }
+            }
+        }, 50);
+    };
+};
+
+
 
 /**
  * Export methods from a worker to the main thread.
@@ -51,28 +190,11 @@ type Async<T extends FunctionMap> = {
  * });
  * ```
  */
-export function exportWorker<T extends FunctionMap>(handlers: T): Async<T> {
-  self.onmessage = async ({ data }: { data: CommRequest; }) => {
-    try {
-      // Get handler from registrations
-      const handler = handlers[data.name];
-      if (!handler) throw new Error(`[BUG] No handler for type ${data.name}`);
+export function exportWorker<T extends Record<string, Function>>(handlers: T): Async<T> {
+    const handler = new Map(Object.entries(handlers));
 
-      // Run handler
-      let result = handler.apply(self, data.args);
-      if (result instanceof Promise) {
-        result = await result;
-      }
-
-      // Success - post back to main thread
-      self.postMessage({ reqid: data.reqid, resolve: result } as CommResult);
-    } catch (e: any) {
-      // Error - post back rejection
-      self.postMessage({ reqid: data.reqid, reject: e.message } as CommResult);
-    }
-  };
-
-  return null as unknown as Async<T>;
+    self.onmessage = messageHandler(self, handler);
+    return null as unknown as Async<T>;
 }
 
 /**
@@ -96,71 +218,31 @@ export function exportWorker<T extends FunctionMap>(handlers: T): Async<T> {
  * ```
  */
 export function importWorker<T>(worker: Worker) {
-  const promises = new Map<number, { resolve: Function; reject: Function; }>();
+    const promises = new Map<number, { resolve: Function; reject: Function; }>();
+    const handlers = new Map<string, Function>();
+    const cg = new WeakMap<Function, number>();
 
-  // Handle messages from worker
-  worker.onmessage = ({ data }: { data: CommResult; }) => {
-    const { reqid, resolve, reject } = data;
-    if (resolve) promises.get(reqid)?.resolve(resolve);
-    if (reject) promises.get(reqid)?.reject(reject);
-    promises.delete(reqid);
-  };
+    // Handle messages from worker
+    worker.onmessage = messageHandler(worker, handlers, promises, cg);
 
-  // Create proxy to call worker methods
-  const proxy = new Proxy(worker, {
-    get(target: Worker, name: string) {
-      return async function wrapper(...args: any[]) {
-        return await new Promise((resolve, reject) => {
-          const reqid = Math.random();
-          promises.set(reqid, { resolve, reject });
-          target.postMessage({ reqid, name, args } as CommRequest, {
-            transfer: args.filter(isTransferred)
-          });
-        });
-      };
-    },
-  });
+    // Create proxy to call worker methods
+    const proxy = new Proxy(worker, {
+        get(target: Worker, name: string) {
+            return async function wrapper(...args: any[]) {
+                return await new Promise((resolve, reject) => {
+                    const reqid = Math.random();
+                    promises.set(reqid, { resolve, reject });
+                    target.postMessage({
+                        isRequest: true,
+                        reqid, name, args: args.map((arg) => typeof arg === 'function' ? fn2obj(arg, handlers) : arg)
+                    } as CommRequest, {
+                        transfer: getTransferableObjects(args)
+                    });
+                });
+            };
+        },
+    });
 
-  return proxy as T;
+    return proxy as T;
 }
 
-// Key to mark an object as transferred
-const TRANSFERRED_KEY = "_wwt_is_transferred_";
-
-/**
- * Type to mark an object as transferred.
- *
- * @example
- * ```ts
- * // myworker.ts
- * function foo(buffer: Transferred<ArrayBuffer>) {
- *  // buffer is transferred
- * }
- */
-export type Transferred<T> = T & { [TRANSFERRED_KEY]: true; };
-
-/**
- * Mark an object as transferred.
- *
- * @param object Object to transfer
- *
- * @example
- * ```ts
- * // main.ts
- * worker.foo(transfer(new ArrayBuffer(1000)));
- */
-export function transfer<T extends Transferable>(object: T): Transferred<T> {
-  if (typeof object === 'object') {
-    (<any>object)[TRANSFERRED_KEY] = true;
-    return object as Transferred<T>;
-  }
-
-  throw new Error('Only objects can be transferred');
-}
-
-/**
- * Check if an object is transferred.
- */
-function isTransferred<T>(object: T): object is Transferred<T> {
-  return typeof object === 'object' && (<any>object)[TRANSFERRED_KEY] === true;
-}
