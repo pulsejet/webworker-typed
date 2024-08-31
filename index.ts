@@ -24,15 +24,23 @@ type CommResult = {
  */
 type FunctionMap = { [name: string]: Function; };
 
-// 将所有方法转换为异步,方法参数结尾增加一个numer类型的参数，并将参数内传递的函数转换为可以异步
+
 type Async<T extends FunctionMap> = {
-    [K in keyof T]: T[K] extends (...args: infer A) => infer R
-    ? (...args: A) => Promise<R>
-    : never;
+    [K in keyof T]: T[K] extends (...args: infer A) => Promise<infer R>
+    ? (...args: SyncArgs<A>) => Promise<R>
+    :
+    (
+        T[K] extends (...args: infer A) => infer B
+        ? (...args: SyncArgs<A>) => Promise<B> : never
+    )
 };
 
+type SyncArgs<T> = {
+    [K in keyof T]: T[K] extends (...args: infer A) => Promise<infer R>
+    ? (...args: A) => R | Promise<R> :T[K]
+}
 
-// Key to mark an function as transferred
+
 const TRANSFERRED_FUNCTION_KEY = "_wwt_is_transferred_function_";
 // Timeout for cleaning up old functions
 const TEMP_FUNCTION_CG = 30 * 1000;
@@ -161,6 +169,8 @@ const messageHandler = (thread: Worker | Window & typeof globalThis,
     };
 };
 
+
+
 /**
  * Export methods from a worker to the main thread.
  *
@@ -180,7 +190,7 @@ const messageHandler = (thread: Worker | Window & typeof globalThis,
  * });
  * ```
  */
-export function exportWorker<T extends FunctionMap>(handlers: T): Async<T> {
+export function exportWorker<T extends Record<string, Function>>(handlers: T): Async<T> {
     const handler = new Map(Object.entries(handlers));
 
     self.onmessage = messageHandler(self, handler);
