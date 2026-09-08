@@ -1,6 +1,6 @@
 {
     "name": "webworker-typed",
-    "version": "1.0.5",
+    "version": "1.0.6",
     "license": "MIT",
     "description": "Typed Web Workers with Async/Await",
     "repository": {
@@ -15,7 +15,7 @@
     },
     "author": "Varun Patil",
     "peerDependencies": {
-        "typescript": "^5.2.2"
+        "typescript": ">=5.2.2"
     },
     "devDependencies": {
         "typescript": "^5.2.2"
