@@ -1,166 +1,248 @@
-/**
- * Data sent from main thread to worker.
- */
+
+const transformData = (obj: any, cache = new Map(), idGen = (function* () {
+    let id = 0;
+    while (true) {
+        yield id++;
+    }
+})()) => {
+    if (cache.has(obj)) return cache.get(obj);
+    switch (typeof obj) {
+        case 'object': {
+            if (obj._IS_TRANSFORMED_) return obj;
+            const newObj = Array.isArray(obj) ? new Array(obj.length) : {};
+            for (const key in obj) {
+                // @ts-ignore
+                newObj[key] = objectHandler(obj[key], cache, idGen);
+            }
+            cache.set(obj, newObj);
+            return newObj;
+        }
+        case 'function': {
+            const e = { id: idGen.next().value, type: 'fn_str', code: obj.toString(), _IS_TRANSFORMED_: true };
+            cache.set(obj, e);
+        }
+
+        default:
+            return obj;
+    }
+}
+
+const createRequset = (event: RuntimeEvent, name: string, args: any, transfer?: Transferable[], timeout = 5000) => {
+    let reqid = Math.random().toString(36);
+    return new Promise((resolve, reject) => {
+        while (true) {
+            if (!event.promises.has(reqid)) break;
+            reqid = Math.random().toString(36);
+        }
+        event.promises.set(reqid, { resolve, reject });
+        event.thread.postMessage({
+            __IS_TYPED_WORKER__: true,
+            isRequest: true,
+            reqid,
+            name,
+            args: transformData(args),
+        }, {
+            transfer
+        })
+        setTimeout(() => {
+            reject('Request timed out');
+        }, timeout)
+    }).finally(() => {
+        event.promises.delete(reqid);
+    })
+}
+
+const restoreMessage = (event: RuntimeEvent, root: MessageEvent, obj = root.data.data, cache = new Map()) => {
+    return new Proxy(obj, {
+        get(target, prop, receiver) {
+            const value = Reflect.get(target, prop, receiver);
+            if (typeof value === 'object' && value !== null) {
+                if (value._IS_TRANSFORMED_) {
+                    switch (value.type) {
+                        case 'fn': {
+                            return (args: any, transfer?: Transferable[], timeout = 5000) => {
+                                return createRequset(event, value.id, args, transfer, timeout);
+                            }
+                        }
+                        case 'fn_str': {
+                            cache.set(value.id, new Function(value.code));
+                            break
+                        }
+                    }
+                    return cache.get(value.id);
+                }
+                return restoreMessage(event, root, value, cache);
+            }
+            return value;
+        },
+        set(target, prop, value, receiver) {
+            return Reflect.set(target, prop, value, receiver);
+        }
+    })
+}
+
+
 type CommRequest = {
-  reqid: number;
-  name: string;
-  args: unknown[];
+    __IS_TYPED_WORKER__: true;
+    isRequest: true;
+    reqid: string;
+    name: string;
+    args: unknown[];
 };
 
 /**
  * Data sent from worker to main thread.
  */
 type CommResult = {
-  reqid: number;
-  resolve?: unknown;
-  reject?: string;
+    __IS_TYPED_WORKER__: true;
+    isRequest: false;
+    reqid: string;
+    isReject?: boolean;
+    data: unknown;
 };
 
-/**
- * Map of function names to functions.
- */
-type FunctionMap = { [name: string]: Function; };
+type RuntimeEvent = {
+    thread: Worker | Window,
+    handlers: Map<string, Function>
+    promises: Map<string, { resolve: Function; reject: Function; }>
+    cg: WeakMap<Function, number>
+}
 
-/**
- * Utility type to convert all methods in an object to async.
- */
-type Async<T extends FunctionMap> = {
-  [K in keyof T]: T[K] extends (...args: infer A) => Promise<infer R>
-  ? (...args: A) => Promise<R>
-  : T[K] extends (...args: infer A) => infer R
-  ? (...args: A) => Promise<R>
-  : T[K];
-};
+const TEMP_FUNCTION_CG = 30 * 1000;
+const TEMP_NAME_PREFIX = 'temp_fn_';
 
-/**
- * Export methods from a worker to the main thread.
- *
- * @param handlers Object with methods to export
- *
- * @example
- * ```ts
- * // my-worker.ts
- * function foo() { return 'bar'; }
- *
- * async function asyncFoo() { return 'bar'; }
- *
- * export default exportWorker({
- *   foo,
- *   asyncFoo,
- *   inline: () => 'bar',
- * });
- * ```
- */
-export function exportWorker<T extends FunctionMap>(handlers: T): Async<T> {
-  self.onmessage = async ({ data }: { data: CommRequest; }) => {
-    try {
-      // Get handler from registrations
-      const handler = handlers[data.name];
-      if (!handler) throw new Error(`[BUG] No handler for type ${data.name}`);
 
-      // Run handler
-      let result = handler.apply(self, data.args);
-      if (result instanceof Promise) {
-        result = await result;
-      }
-
-      // Success - post back to main thread
-      self.postMessage({ reqid: data.reqid, resolve: result } as CommResult);
-    } catch (e: any) {
-      // Error - post back rejection
-      self.postMessage({ reqid: data.reqid, reject: e.message } as CommResult);
+const createRuntime = (thread: Worker | Window) => {
+    return {
+        thread,
+        handlers: new Map(),
+        promises: new Map(),
+        cg: new WeakMap(),
     }
-  };
-
-  return null as unknown as Async<T>;
 }
 
-/**
- * Import a worker exported with `exportWorker`.
- *
- * @param worker Worker to import
- *
- * @example
- * ```ts
- * // main.ts
- * import type MyWorker from './my-worker.ts';
- *
- * const worker = importWorker<typeof MyWorker>(new Worker(new URL('./XImgWorkerStub.ts', import.meta.url)));
- *
- * (async () => {
- *   // all methods are async
- *   console.assert(await worker.foo() === 'bar');
- *   console.assert(await worker.asyncFoo() === 'bar');
- *   console.assert(await worker.inline() === 'bar');
- * })();
- * ```
- */
-export function importWorker<T>(worker: Worker) {
-  const promises = new Map<number, { resolve: Function; reject: Function; }>();
+const messageHandler = (event: RuntimeEvent) => {
+    const { thread, handlers, promises, cg } = event;
+    let cgCdlieId = 0;
+    return async (m: MessageEvent) => {
+        // console.log('worker message', m);
+        if (!m.data.__IS_TYPED_WORKER__)
+            return;
+        const data = m.data as CommRequest | CommResult;
+        try {
+            if (data.isRequest) {
+                const fn = handlers.get(data.name);
+                if (fn) {
+                    cg.has(fn) && cg.set(fn, Date.now());
+                    try {
+                        const result = await fn(...data.args);
+                        thread.postMessage({
+                            __IS_TYPED_WORKER__: true,
+                            isRequest: false,
+                            reqid: data.reqid,
+                            data: transformData(result),
+                        })
 
-  // Handle messages from worker
-  worker.onmessage = ({ data }: { data: CommResult; }) => {
-    const { reqid, resolve, reject } = data;
-    if (resolve) promises.get(reqid)?.resolve(resolve);
-    if (reject) promises.get(reqid)?.reject(reject);
-    promises.delete(reqid);
-  };
+                    } catch (e) {
+                        thread.postMessage({
+                            __IS_TYPED_WORKER__: true,
+                            isRequest: false,
+                            reqid: data.reqid,
+                            isReject: true,
+                            data: transformData(e),
+                        });
+                    }
+                } else {
+                    thread.postMessage({
+                        __IS_TYPED_WORKER__: true,
+                        isRequest: false,
+                        reqid: data.reqid,
+                        isReject: true,
+                        data: 'Function not found'
+                    });
+                }
+            } else {
+                const promise = promises.get(data.reqid);
+                // console.log('promise', promise, promises);
+                if (promise) {
+                    const res = data.data;
+                    const unpacked = (typeof res === 'object' && res !== null) ? restoreMessage(event, m) : res;
 
-  // Create proxy to call worker methods
-  const proxy = new Proxy(worker, {
-    get(target: Worker, name: string) {
-      return async function wrapper(...args: any[]) {
-        return await new Promise((resolve, reject) => {
-          const reqid = Math.random();
-          promises.set(reqid, { resolve, reject });
-          target.postMessage({ reqid, name, args } as CommRequest, {
-            transfer: args.filter(isTransferred)
-          });
-        });
-      };
-    },
-  });
+                    data.isReject ?
+                        promise.reject(unpacked)
+                        :
+                        promise.resolve(unpacked);
 
-  return proxy as T;
+                }
+            }
+        } catch (e) {
+            console.error(e);
+            promises.forEach((p) => p.reject(e));
+        }
+        cgCdlieId && clearTimeout(cgCdlieId);
+        // 节流遍历
+        cgCdlieId = setTimeout(() => {
+            // 遍历获得全部
+            for (const [name, fn] of handlers) {
+                if (!name.startsWith(TEMP_NAME_PREFIX)) continue;
+                const now = Date.now();
+                if (!cg.has(fn)) {
+                    cg.set(fn, now);
+                    continue;
+                }
+                if (now - cg.get(fn)! > TEMP_FUNCTION_CG) {
+                    handlers.delete(name);
+                }
+            }
+        }, TEMP_FUNCTION_CG);
+    }
 }
 
-// Key to mark an object as transferred
-const TRANSFERRED_KEY = "_wwt_is_transferred_";
 
-/**
- * Type to mark an object as transferred.
- *
- * @example
- * ```ts
- * // myworker.ts
- * function foo(buffer: Transferred<ArrayBuffer>) {
- *  // buffer is transferred
- * }
- */
-export type Transferred<T> = T & { [TRANSFERRED_KEY]: true; };
-
-/**
- * Mark an object as transferred.
- *
- * @param object Object to transfer
- *
- * @example
- * ```ts
- * // main.ts
- * worker.foo(transfer(new ArrayBuffer(1000)));
- */
-export function transfer<T extends Transferable>(object: T): Transferred<T> {
-  if (typeof object === 'object') {
-    (<any>object)[TRANSFERRED_KEY] = true;
-    return object as Transferred<T>;
-  }
-
-  throw new Error('Only objects can be transferred');
+export const defineReceive = <T extends Record<string, (...args: any[]) => any>>(e: T) => {
+    const event = createRuntime(self);
+    Object.entries(e).forEach(([name, fn]) => {
+        event.handlers.set(name, fn);
+    });
+    self.onmessage = messageHandler(event);
+    return null as unknown as () => ReturnType<typeof useWorker<T>>;
 }
 
-/**
- * Check if an object is transferred.
- */
-function isTransferred<T>(object: T): object is Transferred<T> {
-  return typeof object === 'object' && (<any>object)[TRANSFERRED_KEY] === true;
+export type WorkerCallBack<T> = (T extends (...args: any[]) => any ? (...args: Parameters<T>) => Promise<Awaited<ReturnType<T>>> : never);
+
+export const useWorker = <T extends Record<string, (...args: any[]) => any>>(worker: Worker) => {
+    const event = createRuntime(worker);
+    worker.addEventListener('error', (e) => {
+        event.handlers.clear();
+        event.promises.forEach((p) => p.reject('connection error'));
+    });
+    worker.addEventListener('message', messageHandler(event));
+    return {
+        worker,
+        event,
+        cb: <T extends (...args: any[]) => any>(e: T, name: string) => {
+            let id: string;
+            if (name) {
+                id = name;
+            } else {
+                id = TEMP_NAME_PREFIX + Math.random().toString(36).slice(2);
+                while (event.handlers.has(id)) {
+                    id = TEMP_NAME_PREFIX + Math.random().toString(36).slice(2);
+                }
+            }
+            event.handlers.set(id, e);
+            return {
+                _IS_TRANSFORMED_: true,
+                type: 'fn',
+                id: TEMP_NAME_PREFIX + Math.random().toString(36).slice(2),
+            }
+        },
+        methods: new Proxy({}, {
+            get(_target, key) {
+                return (args: any, transfer?: Transferable[], timeout = 5000) => {
+                    return createRequset(event, key as string, args, transfer, timeout);
+                }
+            }
+        }) as { [K in keyof T]: WorkerCallBack<T[K]> }
+    }
 }
